@@ -1,209 +1,194 @@
-use eframe::{egui, Frame};
-use egui::{Align, Button, Context, Layout, TopBottomPanel};
-use std::path::PathBuf;
-use std::sync::mpsc::{Sender, Receiver};
-use std::thread;
-use std::sync::mpsc;
+#![allow(clippy::needless_return)]
 
-pub enum ViewMode {
+use eframe::{
+    Frame, egui,
+    egui::{Button, Context, Key, ProgressBar, TopBottomPanel},
+};
+use egui::{RichText, TextEdit};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
+    time::{Duration, Instant},
+};
+
+mod browser;
+mod clipboard;
+mod config;
+mod fs_ops;
+mod history;
+mod platform;
+mod searcher;
+
+#[derive(Clone)]
+struct Toast {
+    text: String,
+    created: Instant,
+    ttl: Duration,
+}
+struct Toaster {
+    items: Vec<Toast>,
+}
+
+impl Toaster {
+    fn new() -> Self {
+        Self { items: vec![] }
+    }
+
+    fn info(&mut self, text: impl Into<String>) {
+        self.items.push(Toast {
+            text: text.into(),
+            created: Instant::now(),
+            ttl: Duration::from_secs(4),
+        });
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.items.push(Toast {
+            text: format!("❗ {}", text.into()),
+            created: Instant::now(),
+            ttl: Duration::from_secs(6),
+        });
+    }
+
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        self.items.retain(|t| t.created.elapsed() < t.ttl);
+        for t in &self.items {
+            ui.label(RichText::new(&t.text));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CreateKind {
+    Folder,
+    File,
+}
+
+enum ViewMode {
     Browsing,
     Searching {
         results: Vec<PathBuf>,
-        receiver: Receiver<PathBuf>,
+        rx_results: Receiver<searcher::SearchMsg>,
+        rx_prog: Receiver<searcher::ProgressMsg>,
+        abort: Arc<AtomicBool>,
+        scanned_files: u64,
+        scanned_dirs: u64,
+        done: bool,
+        started_at: Instant,
     },
 }
 
-mod browser;
-
 struct AppData {
     current_path: PathBuf,
-    search_query: String,
-    pinned: Vec<PathBuf>,
     path_edit: String,
-    undo_stack: Vec<(PathBuf, ViewMode)>,
-    redo_stack: Vec<(PathBuf, ViewMode)>,
+
+    pinned: Vec<PathBuf>,
+
+    search_query: String,
+    mode: ViewMode,
+
+    nav_hist: history::NavHistory,
+
+    ops_hist: history::OpsHistory,
+
     autocomplete: Vec<String>,
     scale_factor: f32,
     browser: browser::FileBrowser,
-    search: ViewMode,
-}
 
-fn get_os_root() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from("C:\\")
-    }
+    clipboard: clipboard::Clipboard,
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        PathBuf::from("/")
-    }
-}
+    open_with_buffer: String,
+    open_with_target: Option<PathBuf>,
 
-fn load_pinned_folders() -> Vec<PathBuf> {
-    let path = get_pinned_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
+    toasts: Toaster,
 
-    if !path.exists() {
-        return vec![dirs::home_dir().unwrap_or_default(), get_os_root()];
-    }
-
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return vec![dirs::home_dir().unwrap_or_default(), get_os_root()];
-    };
-
-    let lines: Vec<_> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    if lines.is_empty() {
-        return vec![dirs::home_dir().unwrap_or_default(), get_os_root()];
-    }
-
-    lines.into_iter().map(PathBuf::from).collect()
-}
-
-fn save_pinned_folders(pinned: &[PathBuf]) {
-    let path = get_pinned_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
-
-    let content = pinned
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    std::fs::write(path, content).ok();
-}
-
-fn load_config_scale() -> f32 {
-    let path = get_config_path();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        for line in content.lines() {
-            if let Some(value) = line.strip_prefix("scale=") {
-                if let Ok(scale) = value.trim().parse::<f32>() {
-                    return scale.clamp(0.5, 3.0);
-                }
-            }
-        }
-    }
-    1.0
-}
-
-fn save_config_scale(scale: f32) {
-    let path = get_config_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
-    let content = format!("scale={:.2}\n", scale.clamp(0.5, 3.0));
-    std::fs::write(path, content).ok();
-}
-
-fn get_pinned_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("C:\\rex")); 
-
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::home_dir()
-        .map(|h| h.join(".rex"))
-        .unwrap_or_else(|| PathBuf::from(".rex"));
-
-    base.join("pinned.ini")
-}
-
-fn get_config_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("C:\\rex"));
-
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::home_dir().map(|h| h.join(".rex")).unwrap_or_else(|| PathBuf::from(".rex"));
-
-    base.join("config.ini")
+    create_dialog: Option<(CreateKind, PathBuf)>,
+    create_name_buffer: String,
 }
 
 impl Default for AppData {
     fn default() -> Self {
-        let current_path = std::env::current_dir().unwrap_or_default();
+        let current_path = std::env::current_dir().unwrap_or_else(|_| config::os_root());
         Self {
             path_edit: current_path.display().to_string(),
             current_path,
+            pinned: config::load_pinned(),
             search_query: String::new(),
-            pinned: load_pinned_folders(),
-            undo_stack: vec![],
-            redo_stack: vec![],
+            mode: ViewMode::Browsing,
+            nav_hist: history::NavHistory::default(),
+            ops_hist: history::OpsHistory::new(64),
             autocomplete: vec![],
-            scale_factor: load_config_scale(),
+            scale_factor: config::load_scale(),
             browser: browser::FileBrowser::new(),
-            search: ViewMode::Browsing,
+            clipboard: clipboard::Clipboard::default(),
+            open_with_buffer: String::new(),
+            open_with_target: None,
+            toasts: Toaster::new(),
+            create_dialog: None,
+            create_name_buffer: String::new(),
         }
     }
 }
 
 impl Drop for AppData {
     fn drop(&mut self) {
-        save_pinned_folders(&self.pinned);
-        save_config_scale(self.scale_factor);
+        config::save_pinned(&self.pinned);
+        config::save_scale(self.scale_factor);
     }
 }
 
 impl AppData {
     fn navigate_to(&mut self, new_path: PathBuf) {
         if new_path.exists() && new_path.is_dir() {
-            self.undo_stack.push((self.current_path.clone(), std::mem::replace(&mut self.search, ViewMode::Browsing)));
-            self.redo_stack.clear();
-            self.current_path = new_path;
-            self.path_edit = self.current_path.display().to_string();
+            if new_path != self.current_path {
+                self.nav_hist.push(self.current_path.clone());
+            }
+            self.current_path = new_path.clone();
+            self.path_edit = new_path.display().to_string();
+            self.browser.invalidate();
         } else {
+            self.toasts
+                .error("Path does not exist or is not a directory.");
             self.path_edit = self.current_path.display().to_string();
         }
     }
-
-
-    fn undo(&mut self) {
-        if let Some((prev_path, prev_search)) = self.undo_stack.pop() {
-            self.redo_stack.push((self.current_path.clone(), std::mem::replace(&mut self.search, prev_search)));
-            self.current_path = prev_path;
-            self.path_edit = self.current_path.display().to_string();
-        }
+    fn back(&mut self) {
+        let _ = self.nav_hist.back(&mut self.current_path);
+        self.path_edit = self.current_path.display().to_string();
+        self.browser.invalidate();
     }
-
-    fn redo(&mut self) {
-        if let Some((next_path, next_search)) = self.redo_stack.pop() {
-            self.undo_stack.push((self.current_path.clone(), std::mem::replace(&mut self.search, next_search)));
-            self.current_path = next_path;
-            self.path_edit = self.current_path.display().to_string();
-        }
+    fn forward(&mut self) {
+        let _ = self.nav_hist.forward(&mut self.current_path);
+        self.path_edit = self.current_path.display().to_string();
+        self.browser.invalidate();
     }
-
 
     fn update_autocomplete(&mut self) {
         let input = self.path_edit.clone();
-        let parent = PathBuf::from(&input).parent().map(PathBuf::from)
+        let parent = PathBuf::from(&input)
+            .parent()
+            .map(PathBuf::from)
             .unwrap_or_else(|| self.current_path.clone());
 
         if !parent.exists() || !parent.is_dir() {
             self.autocomplete.clear();
             return;
         }
-
         let prefix = PathBuf::from(&input)
             .file_name()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-
         let mut matches = vec![];
-
         if let Ok(read) = std::fs::read_dir(parent) {
             for entry in read.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if name.to_lowercase().starts_with(&prefix) {
@@ -212,206 +197,461 @@ impl AppData {
                 }
             }
         }
-
         matches.sort();
-        matches.truncate(5);
+        matches.truncate(6);
         self.autocomplete = matches;
+    }
+
+    fn start_search(&mut self) {
+        let (tx_res, rx_res) = mpsc::channel::<searcher::SearchMsg>();
+        let (tx_prog, rx_prog) = mpsc::channel::<searcher::ProgressMsg>();
+        let abort = Arc::new(AtomicBool::new(false));
+        searcher::spawn_search(
+            self.current_path.clone(),
+            self.search_query.clone(),
+            tx_res,
+            tx_prog,
+            abort.clone(),
+        );
+        self.mode = ViewMode::Searching {
+            results: vec![],
+            rx_results: rx_res,
+            rx_prog,
+            abort,
+            scanned_files: 0,
+            scanned_dirs: 0,
+            done: false,
+            started_at: Instant::now(),
+        };
+    }
+
+    fn cancel_search(&mut self) {
+        if let ViewMode::Searching { abort, .. } = &self.mode {
+            abort.store(true, Ordering::Relaxed);
+        }
+        self.mode = ViewMode::Browsing;
+    }
+
+    fn paste_into(&mut self, target_dir: &Path) {
+        if !self.clipboard.has_items() {
+            return;
+        }
+        let mode = self.clipboard.mode.unwrap();
+        let mut any_ok = false;
+        for item in self.clipboard.items.clone() {
+            let res = match mode {
+                clipboard::Mode::Copy => fs_ops::copy(&item, target_dir),
+                clipboard::Mode::Cut => fs_ops::mv(&item, target_dir),
+            };
+            match res {
+                Ok(op) => {
+                    self.ops_hist.push(op);
+                    any_ok = true;
+                }
+                Err(e) => self
+                    .toasts
+                    .error(format!("Paste failed for {}: {e}", item.display())),
+            }
+        }
+        if any_ok {
+            if mode == clipboard::Mode::Cut {
+                self.clipboard.clear();
+            }
+            self.toasts.info("Paste complete.");
+            self.browser.invalidate();
+        }
+    }
+
+    fn try_undo(&mut self) {
+        if let Some(op) = self.ops_hist.pop_undo() {
+            match fs_ops::undo(&op) {
+                Ok(()) => {
+                    self.toasts.info("Undid last operation.");
+                    self.browser.invalidate();
+                }
+                Err(e) => {
+                    self.toasts.error(format!("Undo failed: {e}"));
+                }
+            }
+        }
     }
 }
 
 impl eframe::App for AppData {
     fn update(&mut self, ctx: &Context, _: &mut Frame) {
         ctx.set_pixels_per_point(self.scale_factor);
-
         self.scale_factor = ctx.input(|i| {
-            let mut scale = self.scale_factor;
-
+            let mut s = self.scale_factor;
             if i.modifiers.ctrl {
-                if i.key_pressed(egui::Key::Equals) {
-                    scale = (scale + 0.1).clamp(0.5, 3.0);
+                if i.key_pressed(Key::Equals) {
+                    s = (s + 0.1).clamp(0.5, 3.0);
                 }
-                if i.key_pressed(egui::Key::Minus) {
-                    scale = (scale - 0.1).clamp(0.5, 3.0);
+                if i.key_pressed(Key::Minus) {
+                    s = (s - 0.1).clamp(0.5, 3.0);
                 }
                 if i.raw_scroll_delta.y.abs() > f32::EPSILON {
-                    scale = (scale + i.raw_scroll_delta.y * 0.01).clamp(0.5, 3.0);
+                    s = (s + i.raw_scroll_delta.y * 0.01).clamp(0.5, 3.0);
                 }
-                if i.key_pressed(egui::Key::Num0) {
-                    scale = 1.0;
+                if i.key_pressed(Key::Num0) {
+                    s = 1.0;
+                }
+                if i.key_pressed(Key::N) {
+                    self.create_dialog = Some((CreateKind::File, self.current_path.clone()));
+                    self.create_name_buffer = "New File.txt".into();
+                }
+                if i.modifiers.shift && i.key_pressed(Key::N) {
+                    self.create_dialog = Some((CreateKind::Folder, self.current_path.clone()));
+                    self.create_name_buffer = "New Folder".into();
                 }
             }
-
-            scale
+            s
         });
-
-
 
         TopBottomPanel::top("titlebar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.nav_hist.can_back(), Button::new("⮌"))
+                    .clicked()
+                {
+                    self.back();
+                }
+                if ui
+                    .add_enabled(self.nav_hist.can_forward(), Button::new("⮎"))
+                    .clicked()
+                {
+                    self.forward();
+                }
+
                 if ui.button("⬆").clicked() {
                     if let Some(parent) = self.current_path.parent() {
                         self.navigate_to(parent.to_path_buf());
                     }
                 }
 
-                if ui.add_enabled(!self.undo_stack.is_empty(), Button::new("⮌")).clicked() {
-                    self.undo();
-                }
-
-                if ui.add_enabled(!self.redo_stack.is_empty(), Button::new("⮎")).clicked() {
-                    self.redo();
-                }
-
-                let response = ui.text_edit_singleline(&mut self.path_edit);
-                if response.changed() {
+                let resp = ui.add(TextEdit::singleline(&mut self.path_edit).desired_width(400.0));
+                if resp.changed() {
                     self.update_autocomplete();
                 }
-
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if response.lost_focus() || enter_pressed {
+                let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                if resp.lost_focus() || enter {
                     self.autocomplete.clear();
                 }
-
-                if enter_pressed {
+                if enter {
                     self.navigate_to(PathBuf::from(self.path_edit.clone()));
                 }
 
-
                 if !self.autocomplete.is_empty() {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        for suggestion in self.autocomplete.clone() {
-                            if ui.button(&suggestion).clicked() {
-                                self.path_edit = suggestion.clone();
+                        for s in self.autocomplete.clone() {
+                            if ui.button(&s).clicked() {
+                                self.path_edit = s.clone();
                                 self.autocomplete.clear();
-                                self.navigate_to(PathBuf::from(suggestion));
+                                self.navigate_to(PathBuf::from(s));
                             }
                         }
                     });
                 }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("🔍").clicked() {
-                            let query = self.search_query.clone();
-                            let start_path = self.current_path.clone();
-                            let (tx, rx) = mpsc::channel();
+                ui.separator();
 
-                            thread::spawn(move || {
-                                fn search_dir(dir: PathBuf, query: &str, tx: &Sender<PathBuf>) {
-                                    if let Ok(read) = std::fs::read_dir(dir) {
-                                        for entry in read.flatten() {
-                                            let path = entry.path();
-                                            if path.is_file() {
-                                                if let Some(name) = path.file_name()
-                                                    .and_then(|s| s.to_str()) {
-                                                    if name.contains(query) {
-                                                        tx.send(path.clone()).ok();
-                                                    }
-                                                }
-                                            }
-                                            if path.is_dir() {
-                                                search_dir(path, query, tx);
-                                            }
-                                        }
-                                    }
-                                }
+                ui.add(
+                    TextEdit::singleline(&mut self.search_query).hint_text("Search file name..."),
+                );
+                if ui.button("🔍").clicked() {
+                    self.start_search();
+                }
 
-                                search_dir(start_path, &query, &tx);
-                            });
-
-                            self.search = ViewMode::Searching {
-                                results: vec![],
-                                receiver: rx,
-                            };
-                    }
-                    ui.text_edit_singleline(&mut self.search_query);
-                });
+                if ui.button("↻").clicked() {
+                    self.browser.invalidate();
+                }
             });
         });
-        
-        let pinned = self.pinned.clone();
 
+        let pinned = self.pinned.clone();
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .default_width(150.0)
+            .default_width(170.0)
             .show(ctx, |ui| {
                 ui.heading("📌 Pinned");
-
-                let mut to_unpin = None;
-
-                for pin in pinned.iter() {
-                    let name = pin
+                let mut to_unpin = None::<PathBuf>;
+                for p in pinned {
+                    let name = p
                         .file_name()
-                        .or_else(|| pin.components().last().map(|c| c.as_os_str()))
+                        .or_else(|| p.components().last().map(|c| c.as_os_str()))
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
-
-                    let response = ui.button(&name);
-
-                    if response.clicked() {
-                        self.navigate_to(pin.clone());
+                    let r = ui.button(name);
+                    if r.clicked() {
+                        self.navigate_to(p.clone());
                     }
-
-                    response.context_menu(|ui| {
+                    r.context_menu(|ui| {
                         if ui.button("❌ Unpin").clicked() {
-                            to_unpin = Some(pin.clone());
+                            to_unpin = Some(p.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("📂 Show in parent").clicked() {
+                            if let Some(parent) = p.parent() {
+                                self.navigate_to(parent.to_path_buf());
+                            }
                             ui.close_menu();
                         }
                     });
                 }
-
-                if let Some(unpin_path) = to_unpin {
-                    self.pinned.retain(|p| p != &unpin_path);
+                if let Some(up) = to_unpin {
+                    self.pinned.retain(|x| x != &up);
                 }
-
-
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut navigate_to = None;
-
-            match &mut self.search {
-                ViewMode::Browsing => {
-                    if let Some((navigate, pin)) = self.browser.update(ctx, ui, &self.current_path) {
-                        if let Some(p) = pin {
-                            if !self.pinned.contains(&p) {
-                                self.pinned.push(p);
-                                self.pinned.sort();
-                                self.pinned.dedup();
-                            }
-                        }
-                        if let Some(new_path) = navigate {
-                            self.navigate_to(new_path);
-                            self.browser.invalidate();
-                        }
+            if let ViewMode::Searching {
+                results,
+                rx_results,
+                rx_prog,
+                scanned_files,
+                scanned_dirs,
+                done,
+                started_at,
+                ..
+            } = &mut self.mode
+            {
+                while let Ok(m) = rx_results.try_recv() {
+                    results.push(m.path);
+                }
+                while let Ok(p) = rx_prog.try_recv() {
+                    *scanned_files = p.scanned_files;
+                    *scanned_dirs = p.scanned_dirs;
+                    if p.done {
+                        *done = true;
                     }
                 }
-                ViewMode::Searching { results, receiver } => {
-                    while let Ok(path) = receiver.try_recv() {
-                        results.push(path);
+
+                let results_snapshot: Vec<PathBuf> = results.clone();
+                let sf = *scanned_files;
+                let sd = *scanned_dirs;
+                let dn = *done;
+                let st = *started_at;
+
+                let mut cancel_requested = false;
+                let mut navigate_to: Option<PathBuf> = None;
+
+                ui.horizontal(|ui| {
+                    let elapsed = st.elapsed().as_secs_f32();
+                    let val = if dn {
+                        1.0
+                    } else {
+                        ((elapsed * 0.4).sin() * 0.5 + 0.5).clamp(0.05, 0.95)
+                    };
+                    ui.add(ProgressBar::new(val).show_percentage());
+                    ui.label(format!(
+                        "Scanned: {sf} files in {sd} folders  •  Results: {}",
+                        results_snapshot.len()
+                    ));
+                    if ui.button("❌ Cancel").clicked() {
+                        cancel_requested = true;
                     }
+                });
+                ui.separator();
 
-                    ui.label(format!("Found {} results...", results.len()));
-                    ui.separator();
-
-                    for path in results.iter() {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for path in &results_snapshot {
                         if ui.button(path.display().to_string()).clicked() {
                             navigate_to = Some(path.clone());
-                            break;
                         }
                     }
+                });
 
-                    if ui.button("❌ Cancel Search").clicked() {
-                        self.search = ViewMode::Browsing;
+                if cancel_requested {
+                    self.cancel_search();
+                }
+                if let Some(p) = navigate_to {
+                    if let Some(dir) = p.parent() {
+                        self.navigate_to(dir.to_path_buf());
+                    }
+                    self.mode = ViewMode::Browsing;
+                }
+            } else {
+                let mut on_open = None::<PathBuf>;
+                let mut on_pin = None::<PathBuf>;
+                let mut on_rename = None::<(PathBuf, String)>;
+                let mut on_delete = None::<PathBuf>;
+                let mut on_open_with = None::<PathBuf>;
+                let mut on_open_term = None::<PathBuf>;
+
+                let mut on_copy_req = None::<PathBuf>;
+                let mut on_cut_req = None::<PathBuf>;
+                let mut on_paste_here = None::<PathBuf>;
+                let mut on_undo_req = false;
+                let mut on_new_folder_here = None::<PathBuf>;
+                let mut on_new_file_here = None::<PathBuf>;
+
+                self.browser.update(
+                    ctx,
+                    ui,
+                    &self.current_path,
+                    &mut on_open,
+                    &mut on_pin,
+                    &mut on_rename,
+                    &mut on_delete,
+                    &mut on_open_with,
+                    &mut on_open_term,
+                    &mut on_copy_req,
+                    &mut on_cut_req,
+                    &mut on_paste_here,
+                    &mut on_undo_req,
+                    self.clipboard.has_items(),
+                    &mut on_new_folder_here,
+                    &mut on_new_file_here,
+                );
+
+                if let Some(nav) = on_open {
+                    self.navigate_to(nav);
+                }
+                if let Some(pin) = on_pin {
+                    if !self.pinned.contains(&pin) {
+                        self.pinned.push(pin);
+                        self.pinned.sort();
+                        self.pinned.dedup();
+                        self.toasts.info("Pinned.");
                     }
                 }
+                if let Some((from, new_name)) = on_rename {
+                    match fs_ops::rename(&from, &new_name) {
+                        Ok(op) => {
+                            self.ops_hist.push(op);
+                            self.browser.invalidate();
+                        }
+                        Err(e) => self.toasts.error(format!("Rename failed: {e}")),
+                    }
+                }
+                if let Some(p) = on_delete {
+                    match fs_ops::delete_to_trash(&p) {
+                        Ok(op) => {
+                            self.ops_hist.push(op);
+                            self.browser.invalidate();
+                            self.toasts.info("Moved to trash.");
+                        }
+                        Err(e) => self.toasts.error(format!("Delete failed: {e}")),
+                    }
+                }
+                if let Some(p) = on_open_with {
+                    self.open_with_target = Some(p);
+                    self.open_with_buffer.clear();
+                }
+                if let Some(p) = on_open_term {
+                    platform::open_terminal_in(&p);
+                }
+
+                if let Some(p) = on_copy_req {
+                    self.clipboard.set(vec![p], clipboard::Mode::Copy);
+                    self.toasts.info("Copied to buffer");
+                }
+                if let Some(p) = on_cut_req {
+                    self.clipboard.set(vec![p], clipboard::Mode::Cut);
+                    self.toasts.info("Cut to buffer");
+                }
+                if let Some(target_dir) = on_paste_here {
+                    self.paste_into(&target_dir);
+                }
+                if on_undo_req {
+                    self.try_undo();
+                }
+                if let Some(target_dir) = on_new_folder_here {
+                    self.create_dialog = Some((CreateKind::Folder, target_dir));
+                    self.create_name_buffer = "New Folder".to_string();
+                }
+                if let Some(target_dir) = on_new_file_here {
+                    self.create_dialog = Some((CreateKind::File, target_dir));
+                    self.create_name_buffer = "New File.txt".to_string();
+                }
             }
-            if let Some(path) = navigate_to {
-                self.navigate_to(path);
-                self.search = ViewMode::Browsing;
-            }
+
+            egui::TopBottomPanel::bottom("toasts").show_inside(ui, |ui| {
+                self.toasts.draw(ui);
+            });
         });
 
+        if let Some(tgt) = self.open_with_target.clone() {
+            egui::Window::new("Open with...")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("File: {}", tgt.display()));
+                    ui.horizontal(|ui| {
+                        if ui.button("System default").clicked() {
+                            platform::open_file(&tgt);
+                            self.open_with_target = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.open_with_target = None;
+                        }
+                    });
+                    ui.separator();
+                    ui.label("Or enter a program/command:");
+                    ui.add(
+                        TextEdit::singleline(&mut self.open_with_buffer)
+                            .hint_text("eg. code, notepad, vim"),
+                    );
+                    if ui.button("Open").clicked() {
+                        platform::open_with(&tgt, &self.open_with_buffer);
+                        self.open_with_target = None;
+                    }
+                });
+        }
+        if let Some((kind, target_dir)) = self.create_dialog.clone() {
+            let title = match kind {
+                CreateKind::Folder => "Create folder",
+                CreateKind::File => "Create file",
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Location: {}", target_dir.display()));
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.create_name_buffer)
+                                .desired_width(260.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let do_create = ui.button("Create").clicked()
+                            || ui.input(|i| i.key_pressed(Key::Enter));
+                        let cancel = ui.button("Cancel").clicked()
+                            || ui.input(|i| i.key_pressed(Key::Escape));
+                        if do_create {
+                            let name = self.create_name_buffer.trim();
+                            if name.is_empty() {
+                                self.toasts.error("Name cannot be empty.");
+                            } else {
+                                let res = match kind {
+                                    CreateKind::Folder => fs_ops::mkdir(&target_dir, name),
+                                    CreateKind::File => fs_ops::touch(&target_dir, name),
+                                };
+                                match res {
+                                    Ok(op) => {
+                                        self.ops_hist.push(op);
+                                        self.browser.invalidate();
+                                        self.toasts.info("Created.");
+                                        if let CreateKind::Folder = kind {
+                                            let p = target_dir.join(name);
+                                            if p.is_dir() {
+                                                self.navigate_to(p);
+                                            }
+                                        }
+                                        self.create_dialog = None;
+                                    }
+                                    Err(e) => self.toasts.error(format!("Create failed: {e}")),
+                                }
+                            }
+                        }
+                        if cancel {
+                            self.create_dialog = None;
+                        }
+                    });
+                });
+        }
     }
 }
 

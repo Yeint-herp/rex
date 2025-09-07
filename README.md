@@ -45,9 +45,9 @@ This will:
 
 # TODO
 
-- [ ] Creating folders and files
+- [X] Creating folders and files
 - [ ] Move files and folders
-- [ ] Copy files and folders
+- [X] Copy files and folders
 - [ ] Drag n Drop for pins and moving
 - [ ] File preview panel
 - [ ] Properties pannel
